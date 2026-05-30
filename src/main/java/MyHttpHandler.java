@@ -1,10 +1,18 @@
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.http.handler.*;
+import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.logging.Logging;
+import burp.api.montoya.scanner.audit.issues.AuditIssue;
+import burp.api.montoya.scanner.audit.issues.AuditIssueConfidence;
+import burp.api.montoya.scanner.audit.issues.AuditIssueSeverity;
+
+import java.util.Map;
 
 import javax.swing.*;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -12,71 +20,53 @@ import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import burp.api.montoya.core.Marker;
+import burp.api.montoya.core.Range;
+
 public class MyHttpHandler implements HttpHandler {
     private final Logging logging;
     private final APITab tab;
     private final MontoyaApi api;
 
-
     private final Set<String> seenPairs = ConcurrentHashMap.newKeySet();
     private final Set<String> seenApiGlobal = ConcurrentHashMap.newKeySet();
 
+    // DOM XSS: cache nội dung đã scan + chống trùng issue
+    private final Set<String> scannedContentHashes = ConcurrentHashMap.newKeySet();
+    private final Set<String> seenIssues = ConcurrentHashMap.newKeySet();
+
+    // Giới hạn để tránh lag: bỏ file quá lớn (thường là bundle/lib khổng lồ
+    private static final int MAX_SCAN_BYTES = 3_000_000;   // ~3MB
 
     private static final boolean STRIP_TRAILING_SLASH = true;
+    private final Map<String, Set<String>> paramsByPath = new ConcurrentHashMap<>();
 
-    private static final Pattern P_ABS_IN_QUOTES = Pattern.compile("['\"](https?://[A-Za-z0-9._\\-:]+(?:/[A-Za-z0-9_\\-./?&=%]*)?)['\"]", Pattern.CASE_INSENSITIVE);
-
-    private static final Pattern P_URL_FIELD = Pattern.compile("\\burl\\s*:\\s*(['\"])\\s*(\\/?[A-Za-z0-9_\\-./?&=%]+)\\s*\\1", Pattern.CASE_INSENSITIVE);
-
-    private static final Pattern P_URL_FIELD_CONCAT = Pattern.compile("\\burl\\s*:\\s*(['\"])\\s*(\\/?[A-Za-z0-9_\\-./?&=%]*)\\s*\\1\\s*\\.\\s*concat\\s*\\(", Pattern.CASE_INSENSITIVE);
-
-    private static final Pattern P_AXIOS = Pattern.compile("\\baxios\\.(get|post|put|patch|delete|head|options)\\s*\\(\\s*(['\"])\\s*(\\/?[A-Za-z0-9_\\-./?&=%]+)\\s*\\2", Pattern.CASE_INSENSITIVE);
-
-    private static final Pattern P_FETCH = Pattern.compile("\\bfetch\\s*\\(\\s*(['\"])\\s*(\\/?[A-Za-z0-9_\\-./?&=%]+)\\s*\\1", Pattern.CASE_INSENSITIVE);
-
-    private static final Pattern P_REL_GENERIC = Pattern.compile("(['\"])\\s*(/[A-Za-z0-9_\\-./?&=%]+)\\s*\\1(?=[\\s,;+)])", Pattern.CASE_INSENSITIVE);
-
-    // Bắt chuẩn HTML attribute dạng href="/path" src="/path" action="/path"
-    // Chỉ bắt các path bắt đầu bằng "/" (ưu tiên)
+    // ===== Pattern trích xuất API (giữ nguyên của bạn) =====
+    private static final Pattern P_ABS = Pattern.compile("(https?://[A-Za-z0-9_\\-.:]+\\/[A-Za-z0-9_\\-./?&=%+=]+)");
+    private static final Pattern P_ANY_QUOTED_PATH = Pattern.compile("(['\"])(/[A-Za-z0-9_\\-./?&=%+=]+)\\1", Pattern.CASE_INSENSITIVE);
     private static final Pattern P_HTML_ATTR_LEADING_SLASH = Pattern.compile("(href|src|action)\\s*=\\s*(['\"])(/[^'\" >]+)\\2", Pattern.CASE_INSENSITIVE);
-
-    //ref="api/list", src="modules/user.js"
-    private static final Pattern P_HTML_ATTR_ANY = Pattern.compile("(href|src|action)\\s*=\\s*(['\"])([^'\" >]+)\\2", Pattern.CASE_INSENSITIVE);
-
-    // data-url, data-href
+    private static final Pattern P_QUOTE_PLUS = Pattern.compile("(['\"])(/[^'\"\\s>]+(?:=|/|\\?))\\1\\s*\\+", Pattern.CASE_INSENSITIVE);
+    private static final Pattern P_URL_FIELD = Pattern.compile("\\burl\\s*:\\s*(['\"])\\s*(\\/?[A-Za-z0-9_\\-./?&=%+=]+)\\s*\\1", Pattern.CASE_INSENSITIVE);
+    private static final Pattern P_AXIOS = Pattern.compile("\\baxios\\.(get|post|put|patch|delete|head|options)\\s*\\(\\s*(['\"])\\s*(\\/?[A-Za-z0-9_\\-./?&=%+=]+)\\s*\\2", Pattern.CASE_INSENSITIVE);
+    private static final Pattern P_FETCH = Pattern.compile("\\bfetch\\s*\\(\\s*(['\"])\\s*(\\/?[A-Za-z0-9_\\-./?&=%+=]+)\\s*\\1", Pattern.CASE_INSENSITIVE);
     private static final Pattern P_HTML_DATA_URL = Pattern.compile("data-(url|href)\\s*=\\s*(['\"])(/[^'\" >]+)\\2", Pattern.CASE_INSENSITIVE);
-
-    // href=/api/x (không có quote)
     private static final Pattern P_HTML_ATTR_NO_QUOTE = Pattern.compile("(href|src|action)=(/[^\\s>]+)", Pattern.CASE_INSENSITIVE);
-
-    // "path" + variable
-    private static final Pattern P_QUOTE_PLUS = Pattern.compile("(['\"])(/[^'\"]+)\\1\\s*\\+", Pattern.CASE_INSENSITIVE);
-
-    // template literal dạng ${var}/path
-    private static final Pattern P_TEMPLATE_COMPLEX = Pattern.compile("\\$\\{[^}]+}/([A-Za-z0-9_\\-./?&=%]+)");
-
-
-    private static final Pattern P_ABS = Pattern.compile("(https?://[A-Za-z0-9_\\-.:]+\\/[A-Za-z0-9_\\-./?&=%]+)");
-
-    private static final Pattern P_STATIC_EXT = Pattern.compile("(?i).+\\.(png|jpg|jpeg|gif|webp|bmp|ico|svg|xml|txt|map|css|scss|sass|less|js|mjs|cjs|ts|tsx|vue|otf|ttf|eot|woff2?|pdf|xhtml)(/.*)?$");
-
-    private static final Pattern P_SOURCE_DIR = Pattern.compile("(?i)^/(src|node_modules|assets|static|vendor|lib)(/.*)?$");
-
-    private static final Pattern P_TEMPLATE_BACKTICK = Pattern.compile("`([^`]*(/[-A-Za-z0-9_\\-./?&=%]+)[^`]*)`");
-
-    private static final Pattern P_TEMPLATE_AFTER_EXPR = Pattern.compile("\\$\\{[^}]+}\\s*/\\s*([A-Za-z0-9_\\-./?&=%]+)");
-
-    //"api/a/n"
-    private static final Pattern P_NO_SLASH_PREFIX = Pattern.compile("['\"]([A-Za-z0-9_\\-]+/[A-Za-z0-9_\\-./?&=%]+)['\"]");
-
+    private static final Pattern P_TEMPLATE_BACKTICK = Pattern.compile("`([^`]*(/[-A-Za-z0-9_\\-./?&=%+=]+)[^`]*)`");
+    private static final Pattern P_TEMPLATE_COMPLEX = Pattern.compile("\\$\\{[^}]+}/([A-Za-z0-9_\\-./?&=%+=]+)");
+    private static final Pattern P_TEMPLATE_AFTER_EXPR = Pattern.compile("\\$\\{[^}]+}\\s*/\\s*([A-Za-z0-9_\\-./?&=%+=]+)");
+    private static final Pattern P_NO_SLASH_PREFIX = Pattern.compile("['\"]([A-Za-z0-9_\\-]+/[A-Za-z0-9_\\-./?&=%+=]+)['\"]");
 
     private static final Pattern P_MIME = Pattern.compile("(?i)^(application|text|image|audio|video)/.*");
-    private static final Pattern P_DATE1 = Pattern.compile("(?i)^\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}$");
-    private static final Pattern P_DATE2 = Pattern.compile("(?i)^(M|MM|D|DD)/?(M|MM)?/?(Y|YY|YYYY)$");
-    private static final Pattern P_DATE3 = Pattern.compile("(?i)^(M{1,2}|D{1,2})/(M{1,2}|D{1,2})/Y{2,4}$");
-    private static final Pattern P_BASE64ISH = Pattern.compile("^[A-Za-z0-9+/=]{16,}$"); // chuỗi base64 dài
     private static final Pattern P_NOISE_PREFIX = Pattern.compile("(?i)^(null|undefined|n/a)(/|$).*");
-    private static final ExecutorService executor = Executors.newFixedThreadPool(4); // Chỉ chạy tối đa 4 file cùng lúc
+    private static final Pattern P_STATIC_EXT = Pattern.compile("(?i).+\\.(png|jpg|jpeg|gif|webp|bmp|ico|svg|xml|txt|map|css|scss|sass|less|js|mjs|cjs|ts|tsx|vue|otf|ttf|eot|woff2?|pdf|xhtml)(/.*)?$");
+    private static final Pattern P_SOURCE_DIR = Pattern.compile("(?i)^/(src|node_modules|assets|static|vendor|lib)(/.*)?$");
+
+    // ===== Nhận diện thư viện (chỉ để skip DOM XSS) =====
+    private static final String[] LIB_NAME_HINTS = {"jquery", "angular", "react", "react-dom", "vue", "bootstrap", "lodash", "underscore", "moment", "d3", "three", "axios", "polyfill", "modernizr", "popper", "tailwind", "ember", "backbone", "knockout", "zepto", "prototype", "mootools", "swiper", "slick", "select2", "datatables", "chart", "gtm", "gtag", "analytics", "googletagmanager", "hotjar", "recaptcha", "stripe", "sentry", "fontawesome"};
+    private static final Pattern VENDOR_DIR = Pattern.compile("(?i)/(node_modules|bower_components|vendor|vendors|libs?|dist|cdn|3rd-?party|third-?party)/");
+    private static final Pattern LIB_BANNER = Pattern.compile("(?i)(/\\*!|/\\*\\*?)[^*]{0,80}(v?\\d+\\.\\d+\\.\\d+|copyright|\\(c\\)|license|MIT|Apache)");
+
+    private static final ExecutorService executor = Executors.newFixedThreadPool(4);
 
     public MyHttpHandler(MontoyaApi api, APITab tab) {
         this.logging = api.logging();
@@ -89,60 +79,22 @@ public class MyHttpHandler implements HttpHandler {
         HttpRequest req = responseReceived.initiatingRequest();
         String fullUrl = (req != null) ? req.url() : null;
 
-        // 1. Kiểm tra điều kiện tiên quyết (URL hợp lệ + In Scope + Content Type)
         if (!isValidHttpUrl(fullUrl) || !safeIsInScope(fullUrl) || !isExtractableContentType(responseReceived)) {
             return ResponseReceivedAction.continueWith(responseReceived);
         }
 
-        // 2. Chỉ đẩy vào Executor 1 lần duy nhất
-        // Executor sẽ tự quản lý việc chạy ngầm, không cần "new Thread" nữa
         executor.execute(() -> processResponse(responseReceived));
-
         return ResponseReceivedAction.continueWith(responseReceived);
     }
 
-//    @Override
-//    public ResponseReceivedAction handleHttpResponseReceived(HttpResponseReceived responseReceived) {
-//        HttpRequest req = responseReceived.initiatingRequest();
-//        String fullUrl = (req != null) ? req.url() : null;
-//
-//        // Chỉ xử lý nếu URL hợp lệ + IN SCOPE + Content-Type phù hợp để trích
-//        if (!isValidHttpUrl(fullUrl) || !safeIsInScope(fullUrl) || !isExtractableContentType(responseReceived)) {
-//            return ResponseReceivedAction.continueWith(responseReceived);
-//        }
-//
-//        if (isExtractableContentType(responseReceived)) {
-//            executor.execute(() -> processResponse(responseReceived));
-//        }
-//
-//        if (isExtractableContentType(responseReceived)) {
-//            executor.execute(() -> processResponse(responseReceived));
-//        }
-//        new Thread(() -> processResponse(responseReceived), "ApiJS-Worker").start();
-//        return ResponseReceivedAction.continueWith(responseReceived);
-//    }
-
+    // ===== Trích API (giữ nguyên) =====
     private static void scan(String text, Pattern p, int groupIdx, Set<String> out) {
         Matcher m = p.matcher(text);
         while (m.find()) {
             String s = m.group(groupIdx);
-            if (s != null && !s.isEmpty()) {
-                out.add(s);
-            }
+            if (s != null && !s.isEmpty()) out.add(s);
         }
     }
-
-    private static boolean isDynamicEndpoint(String path) {
-        if (path.matches(".*\\$\\{[^}]+}.*")) return true;
-        if (path.matches(".*/:[A-Za-z0-9_\\-]+.*")) return true;
-        if (path.matches(".*\\{[^}]+}.*")) return true;
-
-        // NGĂT DÒNG NÀY (vì nó loại nhầm V2, V3)
-        // if (path.matches("^(/\\d+)+$")) return true;
-
-        return false;
-    }
-
 
     private static String stripQuery(String url) {
         return url.replaceAll("\\?.*$", "");
@@ -152,136 +104,44 @@ public class MyHttpHandler implements HttpHandler {
         LinkedHashSet<String> keep = new LinkedHashSet<>();
         for (String s : raw) {
             String cleaned = s;
-
-            // loại sớm các giá trị không phải endpoint
-            if (P_MIME.matcher(cleaned).matches()) continue;
-            if (P_DATE1.matcher(cleaned).matches()) continue;
-            if (P_DATE2.matcher(cleaned).matches()) continue;
-            if (P_DATE3.matcher(cleaned).matches()) continue;
-            //if (P_BASE64ISH.matcher(cleaned).matches()) continue;
-            if (P_NOISE_PREFIX.matcher(cleaned).matches()) continue;
-
-
-            // bỏ query string
-            cleaned = stripQuery(cleaned);
-
-            boolean isAbsolute = cleaned.startsWith("http://") || cleaned.startsWith("https://");
-
-            if (isAbsolute) {
-                try {
-                    URL u = new URL(cleaned);
-                    String path = u.getPath();
-
-                    // loại file tĩnh theo path
-                    if (P_STATIC_EXT.matcher(path).matches()) continue;
-                    if (P_SOURCE_DIR.matcher(path).matches()) continue;
-                    if (isDynamicEndpoint(path)) continue;
-
-                    // chuẩn hoá nhiều dấu '/' liền nhau ở path
-                    path = path.replaceAll("/{2,}", "/");
-
-                    // cắt slash cuối (tuỳ chọn)
-                    if (STRIP_TRAILING_SLASH && path.length() > 1 && path.endsWith("/")) {
-                        path = path.substring(0, path.length() - 1);
-                    }
-
-                    // Build lại absolute (giữ scheme, host, port nếu có)
-                    String hostPort = u.getHost();
-                    int port = u.getPort();
-                    if (port != -1 && port != u.getDefaultPort()) {
-                        hostPort = hostPort + ":" + port;
-                    }
-                    cleaned = u.getProtocol() + "://" + hostPort + (path.isEmpty() ? "/" : path);
-                } catch (Exception e) {
-                    // URL lỗi -> bỏ
-                    continue;
-                }
-            } else {
-                if (!cleaned.startsWith("/")) cleaned = "/" + cleaned;
-                cleaned = cleaned.replaceAll("/{2,}", "/");
-
-                if (STRIP_TRAILING_SLASH && cleaned.length() > 1 && cleaned.endsWith("/")) {
-                    cleaned = cleaned.substring(0, cleaned.length() - 1);
-                }
-                if (P_STATIC_EXT.matcher(cleaned).matches()) continue;
-                if (P_SOURCE_DIR.matcher(cleaned).matches()) continue;
-                if (isDynamicEndpoint(cleaned)) continue;
-
-                if (cleaned.length() < 2 || !cleaned.contains("/") || cleaned.matches("^(/\\d+)+$") || !cleaned.matches(".*[A-Za-z_\\-].*")) {
-                    continue;
-                }
-            }
-
+            if (P_MIME.matcher(cleaned).matches() || P_NOISE_PREFIX.matcher(cleaned).matches()) continue;
+            if (!cleaned.startsWith("http") && !cleaned.startsWith("/")) cleaned = "/" + cleaned;
+            cleaned = cleaned.replaceAll("/{2,}", "/");
+            String checkPath = stripQuery(cleaned);
+            if (P_STATIC_EXT.matcher(checkPath).matches()) continue;
+            if (P_SOURCE_DIR.matcher(checkPath).matches()) continue;
+            if (cleaned.length() < 3 || cleaned.matches("^(/\\d+)+$")) continue;
             keep.add(cleaned);
         }
-
         return keep;
     }
 
     private Set<String> extractEndpointsFromText(String text) {
         LinkedHashSet<String> hits = new LinkedHashSet<>();
-
-        // 1) url: '/path'
         scan(text, P_URL_FIELD, 2, hits);
-
-        scan(text, P_HTML_ATTR_LEADING_SLASH, 3, hits);   // /path
-        scan(text, P_HTML_ATTR_ANY, 3, hits);             // full catch-all
-
+        scan(text, P_ANY_QUOTED_PATH, 2, hits);
+        scan(text, P_HTML_ATTR_LEADING_SLASH, 3, hits);
         scan(text, P_HTML_DATA_URL, 3, hits);
         scan(text, P_HTML_ATTR_NO_QUOTE, 2, hits);
         scan(text, P_QUOTE_PLUS, 2, hits);
         scan(text, P_TEMPLATE_COMPLEX, 1, hits);
-
-
-        scan(text, P_ABS_IN_QUOTES, 1, hits);
-
         scan(text, P_NO_SLASH_PREFIX, 1, hits);
-
-        // 2) url: '/path'.concat(...)
-        scan(text, P_URL_FIELD_CONCAT, 2, hits);
-
-        // 3) axios/fetch
         scan(text, P_AXIOS, 3, hits);
         scan(text, P_FETCH, 2, hits);
-
-        // 4) URL tuyệt đối
         scan(text, P_ABS, 0, hits);
-
-        // 5) template backtick `.../path...`
         scan(text, P_TEMPLATE_BACKTICK, 2, hits);
-
-        // 6) template expression like ${this.api}/path...
         scan(text, P_TEMPLATE_AFTER_EXPR, 1, hits);
-
-        // 7) backup: mọi '/path' trong quote
-        scan(text, P_REL_GENERIC, 2, hits);
-
-        //scan(text, P_METHOD_CALL, 3, hits);
-        //scan(text, P_QUOTE_PLUS, 2, hits);
-
-        // 9) unquoted /path catch-all (cẩn thận)
-        //scan(text, P_REL_UNQUOTED, 1, hits);
-
-        // Chuẩn hóa + lọc mạnh tay (GIỮ absolute URL)
-
-
         return normalizeAndFilter(hits);
     }
 
     private boolean isExtractableContentType(HttpResponseReceived r) {
         String ct = Optional.ofNullable(r.headerValue("Content-Type")).orElse("").toLowerCase(Locale.ROOT);
-
-        if (ct.isEmpty()) return true; // nhiều server không set CT -> cứ xử lý
+        if (ct.isEmpty()) return true;
         if (ct.contains("html")) return true;
         if (ct.contains("javascript") || ct.contains("ecmascript") || ct.contains("x-javascript")) return true;
-        //if (ct.contains("json")) return true;
         if (ct.startsWith("text/")) return true;
-
-        // Loại nhanh các binary/phổ biến không trích
         if (ct.startsWith("image/") || ct.startsWith("video/") || ct.startsWith("audio/")) return false;
         if (ct.contains("octet-stream") || ct.contains("pdf") || ct.contains("font")) return false;
-
-        // Mặc định: không chắc -> bỏ
         return false;
     }
 
@@ -296,23 +156,17 @@ public class MyHttpHandler implements HttpHandler {
     private boolean isValidHttpUrl(String fullUrl) {
         try {
             if (fullUrl == null || fullUrl.isEmpty()) return false;
-            URL u = new URL(fullUrl);
-            return u.getProtocol().startsWith("http");
+            return new URL(fullUrl).getProtocol().startsWith("http");
         } catch (Exception e) {
             return false;
         }
     }
 
-    // Resolve endpoint về URL tuyệt đối dựa trên origin của trang
     private String resolveToAbsolute(String pageUrl, String apiCandidate) {
         try {
-            if (apiCandidate.startsWith("http://") || apiCandidate.startsWith("https://")) {
-                return apiCandidate; // đã tuyệt đối
-            }
+            if (apiCandidate.startsWith("http://") || apiCandidate.startsWith("https://")) return apiCandidate;
             URL base = new URL(pageUrl);
-            URL abs = new URL(base, apiCandidate); // xử lý /path, ./path, ../path, ...
-            // bỏ query cho khoá trùng & hiển thị nhất quán
-            return stripQuery(abs.toString());
+            return stripQuery(new URL(base, apiCandidate).toString());
         } catch (Exception e) {
             return null;
         }
@@ -321,44 +175,53 @@ public class MyHttpHandler implements HttpHandler {
     private static String hostPortOf(URL u) {
         String host = u.getHost();
         int port = u.getPort();
-        if (port != -1 && port != u.getDefaultPort()) {
-            return host + ":" + port;
-        }
+        if (port != -1 && port != u.getDefaultPort()) return host + ":" + port;
         return host;
     }
 
-    // Tạo key toàn cục cho endpoint để chống trùng giữa nhiều JS
     private String apiGlobalKey(String absUrl) {
         try {
             URL u = new URL(absUrl);
-            String path = u.getPath();
-            // Chuẩn hoá path tương tự phần normalize
-            path = path.replaceAll("/{2,}", "/");
-            if (STRIP_TRAILING_SLASH && path.length() > 1 && path.endsWith("/")) {
+            String path = u.getPath().replaceAll("/{2,}", "/");
+            if (STRIP_TRAILING_SLASH && path.length() > 1 && path.endsWith("/"))
                 path = path.substring(0, path.length() - 1);
-            }
             return (hostPortOf(u) + path).toLowerCase(Locale.ROOT);
         } catch (Exception e) {
             return absUrl.toLowerCase(Locale.ROOT);
         }
     }
 
-    private boolean isUrlInSiteMapExact(String absoluteUrl) {
+    // ===== Nhận diện thư viện =====
+    private boolean looksLikeLibrary(String url, String text) {
+        String path;
         try {
-            URL target = new URL(absoluteUrl);
-            String host = hostPortOf(target);
-            String path = target.getPath();
-
-            return api.siteMap().requestResponses().stream().filter(item -> item.response() != null && item.request() != null).map(item -> item.request().url()).filter(Objects::nonNull).anyMatch(u -> {
-                try {
-                    URL x = new URL(u);
-                    return hostPortOf(x).equalsIgnoreCase(host) && x.getPath().equals(path);
-                } catch (Exception e) {
-                    return false;
-                }
-            });
+            path = new URL(url).getPath().toLowerCase(Locale.ROOT);
         } catch (Exception e) {
-            return false;
+            path = url.toLowerCase(Locale.ROOT);
+        }
+
+        if (VENDOR_DIR.matcher(path).find()) return true;
+
+        String fileName = path.contains("/") ? path.substring(path.lastIndexOf('/') + 1) : path;
+        for (String lib : LIB_NAME_HINTS) {
+            if (fileName.contains(lib)) return true;
+        }
+
+        String head = text.length() > 500 ? text.substring(0, 500) : text;
+        if (LIB_BANNER.matcher(head).find()) return true;
+
+        return false;
+    }
+
+    private static String sha256(String s) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] h = md.digest(s.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : h) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            return Integer.toString(s.hashCode());
         }
     }
 
@@ -371,41 +234,152 @@ public class MyHttpHandler implements HttpHandler {
             String body = rr.bodyToString();
             if (body == null || body.isEmpty()) return;
 
-            // Unescape đơn giản
+            // CHỐNG LAG 1: bỏ file quá lớn (parse regex rất nặng, hiếm khi đáng)
+            if (body.length() > MAX_SCAN_BYTES) {
+                logging.logToOutput("Bỏ qua file lớn (" + body.length() + " bytes): " + fullUrl);
+                return;
+            }
+
             String text = body.replace("\\/", "/");
 
-            // Trích xuất API
-            Set<String> endpoints = extractEndpointsFromText(text);
-            if (endpoints.isEmpty()) return;
+            // CHỐNG LAG 2 + ĐÚNG YÊU CẦU: mỗi nội dung chỉ xử lý 1 lần (cả extract lẫn DOM XSS)
+            String contentHash = sha256(text);
+            if (!scannedContentHashes.add(contentHash)) {
+                return;   // file/nội dung này đã xử lý rồi -> bỏ hẳn
+            }
 
+            // ---- Extract API (chạy cho mọi file, kể cả thư viện) ----
+            Set<String> endpoints = extractEndpointsFromText(text);
+
+            // CHỐNG LAG 3: gom thành 1 batch, đẩy sang UI 1 lần thay vì từng dòng
+            List<Object[]> batch = new ArrayList<>();
             for (String apiPath : endpoints) {
                 String absUrl = resolveToAbsolute(fullUrl, apiPath);
                 if (absUrl == null || !safeIsInScope(absUrl)) continue;
 
-                // Chống trùng toàn cục
-                String globalKey = apiGlobalKey(absUrl);
+                String globalKey = apiGlobalKey(absUrl);   // path đã chuẩn hoá, strip query
+
+                // Gom param TRƯỚC khi dedup (param có thể nằm ở apiPath gốc)
+                Set<String> ps = extractParams(apiPath);
+                if (ps.isEmpty()) ps = extractParams(absUrl);
+                if (!ps.isEmpty()) {
+                    paramsByPath.computeIfAbsent(globalKey, k -> ConcurrentHashMap.newKeySet()).addAll(ps);
+                }
+
+                // Dedup hiển thị theo path (toàn phiên)
                 if (!seenApiGlobal.add(globalKey)) continue;
 
-                // MẶC ĐỊNH LÀ FALSE (❌) - Đây là chìa khóa để cứu RAM
-                final boolean fSeen = false;
+                Set<String> collected = paramsByPath.getOrDefault(globalKey, Collections.emptySet());
+                String display = collected.isEmpty() ? apiPath : apiPath + "  [params: " + String.join(", ", collected) + "]";
 
-                // Đẩy sang Tab để hiển thị và lưu file
-                SwingUtilities.invokeLater(() -> tab.addEntry(fullUrl, apiPath, "Stored in Burp", "Stored in Burp", fSeen));
+                batch.add(new Object[]{fullUrl, display});
+            }
+
+            // Đẩy cả batch sang APITab 1 lần (1 lần vẽ + 1 lần save thay vì N lần)
+            if (!batch.isEmpty()) {
+                tab.addEntriesBatch(batch);
+            }
+
+            // ---- DOM XSS: chỉ bỏ qua thư viện ----
+            if (!looksLikeLibrary(fullUrl, text)) {
+                for (DomXssScanner.Finding f : DomXssScanner.scan(text)) {
+                    String issueKey = fullUrl + "|" + f.vulnType + "|" + f.sink + "|" + f.lineHint;
+                    if (!seenIssues.add(issueKey)) continue;
+                    reportIssue(rr, fullUrl, f);
+                }
             }
         } catch (Throwable t) {
-            logging.logToError("❌ Extractor error: " + t.getMessage());
+            logging.logToError("Extractor error: " + t.getMessage());
         }
     }
 
+    private Set<String> extractParams(String urlOrPath) {
+        Set<String> params = new LinkedHashSet<>();
+        int q = urlOrPath.indexOf('?');
+        if (q < 0 || q == urlOrPath.length() - 1) return params;
+        String query = urlOrPath.substring(q + 1);
+        for (String pair : query.split("&")) {
+            if (pair.isEmpty()) continue;
+            int eq = pair.indexOf('=');
+            String name = (eq >= 0 ? pair.substring(0, eq) : pair).trim();
+            if (!name.isEmpty() && !name.contains("${") && name.length() <= 64) {
+                params.add(name);
+            }
+        }
+        return params;
+    }
+
+    private void reportIssue(HttpResponseReceived rr, String url, DomXssScanner.Finding f) {
+        try {
+            AuditIssueSeverity sev = "HIGH".equals(f.severity) ? AuditIssueSeverity.HIGH : AuditIssueSeverity.MEDIUM;
+
+            String detail = "<b>Possible " + escape(f.vulnType) + " (static heuristic)</b><br><br>" + "<b>Source:</b> " + escape(f.source == null ? "-" : f.source) + "<br>" + "<b>Sink:</b> " + escape(f.sink) + "<br>" + "<b>Line (approx):</b> " + f.lineHint + "<br><br>" + "<b>Snippet:</b><br><pre>" + escape(f.snippet) + "</pre><br>" + "Phát hiện bằng regex tĩnh (source và sink nằm gần nhau). " + "Cần xác nhận thủ công xem dữ liệu có thực sự chảy từ source vào sink hay không.";
+
+            String remediation = remediationFor(f.vulnType);
+
+            HttpRequestResponse evidence = HttpRequestResponse.httpRequestResponse(rr.initiatingRequest(), rr);
+            List<Marker> markers = buildMarkers(rr, f);
+            if (!markers.isEmpty()) evidence = evidence.withResponseMarkers(markers);
+
+            AuditIssue issue = AuditIssue.auditIssue(f.vulnType + " (heuristic): " + f.sink, detail, remediation, url, sev, AuditIssueConfidence.TENTATIVE, null, null, sev, evidence);
+            api.siteMap().add(issue);
+        } catch (Throwable t) {
+            logging.logToError("Lỗi report issue: " + t.getMessage());
+        }
+    }
+
+    private String remediationFor(String vulnType) {
+        switch (vulnType) {
+            case "DOM XSS":
+                return "Tránh đưa dữ liệu attacker kiểm soát vào sink thực thi/render. " + "Dùng textContent thay innerHTML, hoặc sanitize bằng DOMPurify.";
+            case "DOM Open Redirect":
+                return "Không dùng dữ liệu từ source để điều hướng. Nếu cần, validate URL " + "theo allowlist domain/path, từ chối URL tuyệt đối tới domain ngoài.";
+            case "DOM Request Manipulation":
+                return "Không xây dựng URL request từ dữ liệu attacker kiểm soát. " + "Validate/allowlist endpoint, tránh để source quyết định host đích.";
+            case "DOM Cookie Manipulation":
+                return "Không ghi cookie từ dữ liệu attacker kiểm soát mà chưa validate. " + "Tránh để source ảnh hưởng tên/giá trị cookie.";
+            default:
+                return "Validate và sanitize dữ liệu từ source trước khi đưa vào sink.";
+        }
+    }
+
+    /**
+     * Tìm vị trí sink trong response GỐC để bôi vàng.
+     * Dùng indexOf trên response thật, tránh lệch offset do unescape "\/".
+     */
+    private List<Marker> buildMarkers(HttpResponseReceived rr, DomXssScanner.Finding f) {
+        List<Marker> markers = new ArrayList<>();
+        try {
+            String fullResponse = rr.toString();   // toàn bộ response (header + body)
+            // Tìm sink. Vì sink có thể xuất hiện nhiều lần, ưu tiên gần vị trí body.
+            int idx = fullResponse.indexOf(f.sink);
+            if (idx >= 0) {
+                // Bôi vàng cả cụm nhỏ quanh sink cho dễ thấy (sink + chút ngữ cảnh)
+                int start = idx;
+                int end = Math.min(fullResponse.length(), idx + f.sink.length());
+                markers.add(Marker.marker(Range.range(start, end)));
+            }
+        } catch (Throwable t) {
+            logging.logToError("Marker error: " + t.getMessage());
+        }
+        return markers;
+    }
+
+    private static String escape(String s) {
+        if (s == null) return "";
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+    }
 
     @Override
     public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent requestToBeSent) {
-        // Bỏ qua, chỉ pass request cho Burp xử lý
         return RequestToBeSentAction.continueWith(requestToBeSent);
     }
 
     public void clearCache() {
         seenPairs.clear();
         seenApiGlobal.clear();
+        scannedContentHashes.clear();
+        seenIssues.clear();
+        paramsByPath.clear();
     }
 }

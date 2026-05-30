@@ -155,27 +155,6 @@ public class APITab {
         return panel;
     }
 
-    public void addEntry(String fullUrl, String apiExtracted, String request, String response, boolean inSiteMap) {
-        try {
-            String key = fullUrl + "|" + apiExtracted;
-            if (seenApiKeys.contains(key)) return;
-            seenApiKeys.add(key);
-
-            // STT thực tế dựa trên danh sách tổng
-            int stt = allRows.size() + 1;
-            Object[] row = new Object[]{stt, fullUrl, apiExtracted, inSiteMap ? "✅" : "❌"};
-
-            allRows.add(row);
-
-            SwingUtilities.invokeLater(() -> {
-                // Gọi applyFilter để cập nhật bảng ngay lập tức với STT hiển thị đúng
-                applyFilter();
-                saveData();
-            });
-        } catch (Exception e) {
-            api.logging().logToError("Lỗi addEntry: " + e.getMessage());
-        }
-    }
 
     public synchronized void saveData() {
         if (currentSaveFile == null) return;
@@ -374,8 +353,7 @@ public class APITab {
     private void exportFolders() {
         new Thread(() -> {
             try {
-                String[] blacklist = {"/css/", "/js/", "/images/", "/img/", "/static/", "/assets/", "/fonts/", "/media/", "/vendor/", "/node_modules/", "/scripts/", "/image/",
-                        "image-thumbnail", "logo", "/images-", "/image-", "/images_", "/image_"};
+                String[] blacklist = {"/css/", "/js/", "/images/", "/img/", "/static/", "/assets/", "/fonts/", "/media/", "/vendor/", "/node_modules/", "/scripts/", "/image/", "image-thumbnail", "logo", "/images-", "/image-", "/images_", "/image_"};
 
                 String userHome = System.getProperty("user.home");
                 File exportFile = new File(userHome + File.separator + "Downloads", "folders_in_scope.txt");
@@ -463,5 +441,34 @@ public class APITab {
     private void copyToClipboard(String text) {
         java.awt.datatransfer.StringSelection selection = new java.awt.datatransfer.StringSelection(text);
         java.awt.Toolkit.getDefaultToolkit().getSystemClipboard().setContents(selection, null);
+    }
+
+    /**
+     * Thêm nhiều entry cùng lúc. Chỉ vẽ lại bảng và lưu file 1 lần cho cả batch
+     * -> tránh lag khi 1 file có hàng trăm endpoint.
+     * Mỗi phần tử batch: {fullUrl, apiExtracted}
+     */
+    public void addEntriesBatch(List<Object[]> entries) {
+        boolean added = false;
+        for (Object[] e : entries) {
+            String fullUrl = e[0].toString();
+            String apiExtracted = e[1].toString();
+
+            String key = fullUrl + "|" + apiExtracted;
+            if (seenApiKeys.contains(key)) continue;
+            seenApiKeys.add(key);
+
+            int stt = allRows.size() + 1;
+            allRows.add(new Object[]{stt, fullUrl, apiExtracted, "❌"});
+            added = true;
+        }
+
+        if (added) {
+            // 1 lần duy nhất cho cả batch
+            SwingUtilities.invokeLater(() -> {
+                applyFilter();
+                saveData();
+            });
+        }
     }
 }
